@@ -1,0 +1,55 @@
+# Sleutel maken: eenmalig (of bij wisselen) een Ed25519-sleutelpaar maken.
+#
+# De geheime helft gaat rechtstreeks als omgevingsgeheim SWOP_SIGN_KEY in de omgeving "tekenen" en komt nooit
+# op het scherm. De publieke helft en het key-id staan in de samenvatting van deze run; die gaan in de Bridge.
+# Nodig: tijdelijk repo-geheim SLEUTEL_TOKEN (fine-grained token van Swop Sign, alleen deze repo,
+# "Environments: Read and write"). Verwijder dat geheim en het token direct na deze run.
+name: Sleutel maken
+
+on:
+  workflow_dispatch:
+    inputs:
+      vervangen:
+        description: "Bestaande sleutel vervangen? (alleen bij wisselen van sleutel)"
+        required: true
+        type: choice
+        options: [nee, ja]
+
+permissions:
+  contents: read
+
+jobs:
+  sleutel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: tekenen
+    steps:
+      - name: Eigen repo ophalen
+        run: git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" "$RUNNER_TEMP/self"
+
+      - name: Sleutel maken en opslaan
+        env:
+          GH_TOKEN: ${{ secrets.SLEUTEL_TOKEN }}
+          VERVANGEN: ${{ inputs.vervangen }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || { echo "::error::Repo-geheim SLEUTEL_TOKEN ontbreekt."; exit 1; }
+          php -r 'exit(function_exists("sodium_crypto_sign_keypair") ? 0 : 1);' || { echo "::error::PHP met sodium ontbreekt."; exit 1; }
+          if gh secret list --env tekenen --repo "$GITHUB_REPOSITORY" --json name --jq '.[].name' | grep -qx SWOP_SIGN_KEY; then
+            [[ "$VERVANGEN" == "ja" ]] || { echo "::error::Er staat al een sleutel. Kies 'ja' bij vervangen als je echt wilt wisselen."; exit 1; }
+          fi
+          KEYFILE="$RUNNER_TEMP/sk.txt"
+          php "$RUNNER_TEMP/self/scripts/sleutel.php" "$KEYFILE" > "$RUNNER_TEMP/publiek.json"
+          gh secret set SWOP_SIGN_KEY --env tekenen --repo "$GITHUB_REPOSITORY" < "$KEYFILE"
+          shred -u "$KEYFILE" 2>/dev/null || rm -f "$KEYFILE"
+          KEY_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["key_id"])' "$RUNNER_TEMP/publiek.json")
+          PUB=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["public_key"])' "$RUNNER_TEMP/publiek.json")
+          {
+            echo "## Nieuwe tekensleutel"
+            echo ""
+            echo "- Key-id: \`$KEY_ID\`"
+            echo "- Publieke sleutel: \`$PUB\`"
+            echo ""
+            echo "Zet deze twee in de Bridge (Swop_Bridge_Sign::KEYS) en in Swop Hub (SWOP_SIGN_PUBLIC_KEYS)."
+            echo "Verwijder nu het repo-geheim SLEUTEL_TOKEN en het token zelf."
+          } >> "$GITHUB_STEP_SUMMARY"
