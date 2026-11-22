@@ -1,0 +1,191 @@
+# Tekenen: één release van Swop Hub controleren en, na akkoord van de reviewer, tekenen.
+#
+# Swop Hub start deze workflow (alleen met een token dat "Actions: write" heeft, nooit "Deployments").
+# Job 1 heeft geen tekensleutel: die vergelijkt de zip bestand voor bestand met de bron op de commit.
+# Job 2 draait in de omgeving "tekenen" (verplichte reviewer = het account Swop Sign, alleen vanaf main)
+# en tekent pas na akkoord. Invoer gaat altijd via env, nooit rechtstreeks in een script (geen injectie).
+name: Tekenen
+run-name: "Tekenen ${{ inputs.kind }} ${{ inputs.slug }} ${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id: { description: "Id van het verzoek in Swop Hub", required: true, type: string }
+      nonce: { description: "Eenmalige code van het verzoek", required: true, type: string }
+      kind: { description: "plugin, theme of bridge", required: true, type: choice, options: [plugin, theme, bridge] }
+      slug: { description: "Map van het pakket", required: true, type: string }
+      version: { description: "Versie x.y.z", required: true, type: string }
+      sha256: { description: "sha256 van de zip", required: true, type: string }
+      commit: { description: "Volledige commit in swop-site-plugins (op main)", required: true, type: string }
+      source_dir: { description: "Map in de bron, bijv. producten/swop-hero", required: true, type: string }
+      zip_url: { description: "Kortlevende downloadlink van Swop Hub", required: true, type: string }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tekenen-${{ inputs.kind }}-${{ inputs.slug }}
+  cancel-in-progress: false
+
+env:
+  IN_REQUEST: ${{ inputs.request_id }}
+  IN_NONCE: ${{ inputs.nonce }}
+  IN_KIND: ${{ inputs.kind }}
+  IN_SLUG: ${{ inputs.slug }}
+  IN_VERSION: ${{ inputs.version }}
+  IN_SHA: ${{ inputs.sha256 }}
+  IN_COMMIT: ${{ inputs.commit }}
+  IN_SOURCE_DIR: ${{ inputs.source_dir }}
+  IN_ZIP_URL: ${{ inputs.zip_url }}
+  SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+  HUB_SIGN_URL: ${{ vars.HUB_SIGN_URL }}
+  ZIP_PREFIX: ${{ vars.ZIP_PREFIX }}
+
+jobs:
+  controleren:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      files: ${{ steps.vergelijk.outputs.files }}
+    steps:
+      - name: Invoer controleren
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; echo "REDEN=$1" >> "$GITHUB_ENV"; exit 1; }
+          [[ "$IN_REQUEST" =~ ^[0-9a-f-]{36}$ ]] || fail "Ongeldig verzoek-id."
+          [[ "$IN_NONCE" =~ ^[0-9a-f]{32,64}$ ]] || fail "Ongeldige nonce."
+          [[ "$IN_SLUG" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "Ongeldige slug."
+          [[ "$IN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Ongeldige versie."
+          [[ "$IN_SHA" =~ ^[0-9a-f]{64}$ ]] || fail "Ongeldige sha256."
+          [[ "$IN_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "Commit moet 40 tekens zijn."
+          [[ "$IN_SOURCE_DIR" =~ ^(producten|bron|plugins|themas)/[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "Ongeldige bronmap."
+          [[ -n "$ZIP_PREFIX" && "$IN_ZIP_URL" == "$ZIP_PREFIX"* ]] || fail "Downloadlink komt niet van Swop Hub."
+          [[ -n "$SOURCE_REPO" && -n "$HUB_SIGN_URL" ]] || fail "Variabelen SOURCE_REPO of HUB_SIGN_URL ontbreken."
+          php -r 'exit(function_exists("sodium_crypto_sign_detached") ? 0 : 1);' || fail "PHP met sodium ontbreekt op de runner."
+
+      - name: Zip ophalen en sha256 controleren
+        run: |
+          set -euo pipefail
+          curl -sS --fail --max-time 60 --max-filesize 3500000 -o "$RUNNER_TEMP/release.zip" "$IN_ZIP_URL" \
+            || { echo "REDEN=Zip niet op te halen (link verlopen?)." >> "$GITHUB_ENV"; exit 1; }
+          GOT=$(sha256sum "$RUNNER_TEMP/release.zip" | cut -d' ' -f1)
+          [[ "$GOT" == "$IN_SHA" ]] || { echo "REDEN=sha256 van de zip klopt niet." >> "$GITHUB_ENV"; exit 1; }
+
+      - name: Commit staat op main
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          STATUS=$(gh api "repos/$SOURCE_REPO/compare/$IN_COMMIT...main" --jq .status 2>/dev/null || echo fout)
+          [[ "$STATUS" == "ahead" || "$STATUS" == "identical" ]] \
+            || { echo "REDEN=Commit staat niet op main ($STATUS)." >> "$GITHUB_ENV"; exit 1; }
+          gh api "repos/$SOURCE_REPO/zipball/$IN_COMMIT" > "$RUNNER_TEMP/bron.zip"
+          mkdir -p "$RUNNER_TEMP/bron" && unzip -q "$RUNNER_TEMP/bron.zip" -d "$RUNNER_TEMP/bron"
+
+      - name: Eigen repo ophalen (scripts en vorige handtekeningen)
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" "$RUNNER_TEMP/self"
+
+      - name: Vergelijken met de bron
+        id: vergelijk
+        run: |
+          set -euo pipefail
+          ROOT=$(find "$RUNNER_TEMP/bron" -mindepth 1 -maxdepth 1 -type d | head -1)
+          PREV_DIR="$RUNNER_TEMP/self/getekend/$IN_KIND/$IN_SLUG"
+          PREV=$(ls "$PREV_DIR"/*.json 2>/dev/null | sort -V | tail -1 || true)
+          set +e
+          python3 "$RUNNER_TEMP/self/scripts/vergelijk.py" "$RUNNER_TEMP/release.zip" "$ROOT/$IN_SOURCE_DIR" "$IN_KIND" "$IN_SLUG" "$IN_VERSION" "${PREV:-}" > "$RUNNER_TEMP/uitslag.json"
+          CODE=$?
+          set -e
+          python3 - "$RUNNER_TEMP/uitslag.json" "$CODE" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, sys
+          u = json.load(open(sys.argv[1])); e = os.environ
+          print(f"## {'Klaar om te tekenen' if u.get('ok') else 'Afgekeurd'}: {e['IN_KIND']} {e['IN_SLUG']} {e['IN_VERSION']}\n")
+          print(f"- Commit: https://github.com/{e['SOURCE_REPO']}/commit/{e['IN_COMMIT']}")
+          print(f"- Bronmap: `{e['IN_SOURCE_DIR']}`, sha256 `{e['IN_SHA'][:16]}…`, {u.get('aantal_bestanden', 0)} bestanden gelijk aan de bron")
+          for f in u.get("fouten", []): print(f"- **Fout:** {f}")
+          ch = u.get("gewijzigd_sinds_vorige")
+          if ch is None: print("- Eerste getekende versie van dit pakket.")
+          else:
+              print(f"- Gewijzigd sinds de vorige getekende versie: {len(ch)}")
+              for f in ch[:40]: print(f"  - `{f}`")
+          for f in (u.get("verwijderd_sinds_vorige") or [])[:20]: print(f"  - verwijderd: `{f}`")
+          for w in u.get("waarschuwingen", [])[:20]: print(f"- Let op: {w}")
+          PY
+          if [[ "$CODE" != "0" ]]; then
+            echo "REDEN=$(python3 -c 'import json,sys; print("; ".join(json.load(open(sys.argv[1]))["fouten"])[:400])' "$RUNNER_TEMP/uitslag.json")" >> "$GITHUB_ENV"
+            exit 1
+          fi
+          echo "files=$(python3 -c 'import json,sys,base64; print(base64.b64encode(json.dumps(json.load(open(sys.argv[1]))["bestanden"]).encode()).decode())' "$RUNNER_TEMP/uitslag.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Afkeuring melden aan Swop Hub
+        if: failure()
+        run: |
+          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "nonce": os.environ["IN_NONCE"], "status": "failed", "reason": os.environ.get("REDEN", "Controle mislukt.")[:400], "run_url": os.environ["RUN_URL"]}))')
+          curl -sS --max-time 30 -X POST -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL" || true
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  tekenen:
+    needs: controleren
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: tekenen
+    permissions:
+      contents: write
+    steps:
+      - name: Eigen repo ophalen
+        run: git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" "$RUNNER_TEMP/self"
+
+      - name: Tekenen
+        env:
+          SWOP_SIGN_KEY: ${{ secrets.SWOP_SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          php "$RUNNER_TEMP/self/scripts/teken.php" "$IN_KIND" "$IN_SLUG" "$IN_VERSION" "$IN_SHA" "$IN_COMMIT" > "$RUNNER_TEMP/handtekening.json"
+
+      - name: Vastleggen in deze repo
+        env:
+          FILES_B64: ${{ needs.controleren.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/self"
+          mkdir -p "getekend/$IN_KIND/$IN_SLUG"
+          python3 - <<'PY'
+          import base64, json, os
+          e = os.environ
+          sig = json.load(open(os.path.join(e["RUNNER_TEMP"], "handtekening.json")))
+          out = {"handtekening": sig, "bronmap": e["IN_SOURCE_DIR"], "run": e["RUN_URL"],
+                 "bestanden": json.loads(base64.b64decode(e["FILES_B64"]).decode())}
+          json.dump(out, open(f"getekend/{e['IN_KIND']}/{e['IN_SLUG']}/{e['IN_VERSION']}.json", "w"), indent=1, sort_keys=True)
+          PY
+          git config user.name "Swop Sign"
+          git config user.email "swop-sign@users.noreply.github.com"
+          git add getekend
+          git commit -q -m "Getekend: $IN_KIND $IN_SLUG $IN_VERSION"
+          git push -q origin HEAD:main || echo "::warning::Vastleggen in de repo mislukt; de handtekening gaat wel naar Swop Hub."
+
+      - name: Handtekening naar Swop Hub
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "nonce": os.environ["IN_NONCE"], "status": "signed", "signature": json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "handtekening.json"))), "run_url": os.environ["RUN_URL"]}))')
+          curl -sS --fail --max-time 30 -X POST -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL"
+          echo "## Getekend: $IN_KIND $IN_SLUG $IN_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+  afgewezen:
+    needs: [controleren, tekenen]
+    if: always() && needs.controleren.result == 'success' && needs.tekenen.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Niet getekend melden aan Swop Hub
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULT: ${{ needs.tekenen.result }}
+        run: |
+          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "nonce": os.environ["IN_NONCE"], "status": "rejected", "reason": "Niet getekend (" + os.environ["RESULT"] + ").", "run_url": os.environ["RUN_URL"]}))')
+          curl -sS --max-time 30 -X POST -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL" || true
