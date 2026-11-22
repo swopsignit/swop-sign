@@ -1,75 +1,92 @@
 # Tekenen: één release van Swop Hub controleren en, na akkoord van de reviewer, tekenen.
 #
-# Swop Hub start deze workflow (alleen met een token dat "Actions: write" heeft, nooit "Deployments").
-# Job 1 heeft geen tekensleutel: die vergelijkt de zip bestand voor bestand met de bron op de commit.
-# Job 2 draait in de omgeving "tekenen" (verplichte reviewer = het account Swop Sign, alleen vanaf main)
-# en tekent pas na akkoord. Invoer gaat altijd via env, nooit rechtstreeks in een script (geen injectie).
+# Deze repo is publiek (verplichte reviewers werken op GitHub alleen in publieke repo's zonder Enterprise).
+# Daarom gaat er alleen een verzoek-id als invoer mee; alles wat niet openbaar mag (downloadlink, bestandslijst)
+# haalt job 1 zelf op bij Swop Hub met het geheim HUB_SIGN_TOKEN en komt nooit in het logboek.
+# Job 1 heeft geen tekensleutel en vergelijkt de zip bestand voor bestand met de bron op de commit.
+# Job 2 draait in de omgeving "tekenen" (verplichte reviewer = swopsignit, alleen vanaf main) en tekent pas na akkoord.
+# Alles wat van buiten komt, gaat via env en wordt eerst gecontroleerd; nooit rechtstreeks in een script.
 name: Tekenen
-run-name: "Tekenen ${{ inputs.kind }} ${{ inputs.slug }} ${{ inputs.version }}"
+run-name: "Tekenen verzoek ${{ inputs.request_id }}"
 
 on:
   workflow_dispatch:
     inputs:
       request_id: { description: "Id van het verzoek in Swop Hub", required: true, type: string }
-      nonce: { description: "Eenmalige code van het verzoek", required: true, type: string }
-      kind: { description: "plugin, theme of bridge", required: true, type: choice, options: [plugin, theme, bridge] }
-      slug: { description: "Map van het pakket", required: true, type: string }
-      version: { description: "Versie x.y.z", required: true, type: string }
-      sha256: { description: "sha256 van de zip", required: true, type: string }
-      commit: { description: "Volledige commit in swop-site-plugins (op main)", required: true, type: string }
-      source_dir: { description: "Map in de bron, bijv. producten/swop-hero", required: true, type: string }
-      zip_url: { description: "Kortlevende downloadlink van Swop Hub", required: true, type: string }
 
 permissions:
   contents: read
 
 concurrency:
-  group: tekenen-${{ inputs.kind }}-${{ inputs.slug }}
+  group: tekenen-${{ inputs.request_id }}
   cancel-in-progress: false
 
 env:
   IN_REQUEST: ${{ inputs.request_id }}
-  IN_NONCE: ${{ inputs.nonce }}
-  IN_KIND: ${{ inputs.kind }}
-  IN_SLUG: ${{ inputs.slug }}
-  IN_VERSION: ${{ inputs.version }}
-  IN_SHA: ${{ inputs.sha256 }}
-  IN_COMMIT: ${{ inputs.commit }}
-  IN_SOURCE_DIR: ${{ inputs.source_dir }}
-  IN_ZIP_URL: ${{ inputs.zip_url }}
   SOURCE_REPO: ${{ vars.SOURCE_REPO }}
   HUB_SIGN_URL: ${{ vars.HUB_SIGN_URL }}
   ZIP_PREFIX: ${{ vars.ZIP_PREFIX }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
   controleren:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      files: ${{ steps.vergelijk.outputs.files }}
+      kind: ${{ steps.verzoek.outputs.kind }}
+      slug: ${{ steps.verzoek.outputs.slug }}
+      version: ${{ steps.verzoek.outputs.version }}
+      sha256: ${{ steps.verzoek.outputs.sha256 }}
+      commit: ${{ steps.verzoek.outputs.commit }}
     steps:
-      - name: Invoer controleren
+      - name: Verzoek ophalen bij Swop Hub
+        id: verzoek
+        env:
+          HUB_SIGN_TOKEN: ${{ secrets.HUB_SIGN_TOKEN }}
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; echo "REDEN=$1" >> "$GITHUB_ENV"; exit 1; }
-          [[ "$IN_REQUEST" =~ ^[0-9a-f-]{36}$ ]] || fail "Ongeldig verzoek-id."
-          [[ "$IN_NONCE" =~ ^[0-9a-f]{32,64}$ ]] || fail "Ongeldige nonce."
-          [[ "$IN_SLUG" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "Ongeldige slug."
-          [[ "$IN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Ongeldige versie."
-          [[ "$IN_SHA" =~ ^[0-9a-f]{64}$ ]] || fail "Ongeldige sha256."
-          [[ "$IN_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "Commit moet 40 tekens zijn."
-          [[ "$IN_SOURCE_DIR" =~ ^(producten|bron|plugins|themas)/[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "Ongeldige bronmap."
-          [[ -n "$ZIP_PREFIX" && "$IN_ZIP_URL" == "$ZIP_PREFIX"* ]] || fail "Downloadlink komt niet van Swop Hub."
-          [[ -n "$SOURCE_REPO" && -n "$HUB_SIGN_URL" ]] || fail "Variabelen SOURCE_REPO of HUB_SIGN_URL ontbreken."
+          [[ "$IN_REQUEST" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || fail "Ongeldig verzoek-id."
+          [[ -n "$HUB_SIGN_TOKEN" && -n "$SOURCE_REPO" && -n "$HUB_SIGN_URL" && -n "$ZIP_PREFIX" ]] || fail "Geheim of variabele ontbreekt."
           php -r 'exit(function_exists("sodium_crypto_sign_detached") ? 0 : 1);' || fail "PHP met sodium ontbreekt op de runner."
+          curl -sS --fail --max-time 30 -H "Authorization: Bearer $HUB_SIGN_TOKEN" \
+            -o "$RUNNER_TEMP/verzoek.json" "$HUB_SIGN_URL?request_id=$IN_REQUEST" \
+            || fail "Verzoek niet op te halen bij Swop Hub (al afgehandeld of verlopen?)."
+          # Antwoord van Swop Hub is invoer van buiten: streng controleren voordat iets het gebruikt.
+          python3 - "$RUNNER_TEMP/verzoek.json" <<'PY' || fail "Antwoord van Swop Hub is ongeldig."
+          import json, os, re, sys
+          v = json.load(open(sys.argv[1]))
+          rules = {
+              "kind": r"(plugin|theme|bridge)",
+              "slug": r"[a-z0-9]+(-[a-z0-9]+)*",
+              "version": r"[0-9]+\.[0-9]+\.[0-9]+",
+              "sha256": r"[0-9a-f]{64}",
+              "commit": r"[0-9a-f]{40}",
+              "source_dir": r"(producten|bron|plugins|themas)/[a-z0-9]+(-[a-z0-9]+)*",
+          }
+          for k, pat in rules.items():
+              if not isinstance(v.get(k), str) or not re.fullmatch(pat, v[k]):
+                  sys.exit(f"veld {k}")
+          url = v.get("zip_url")
+          if not isinstance(url, str) or not url.startswith(os.environ["ZIP_PREFIX"]) or any(c in url for c in "\n\r\"' "):
+              sys.exit("zip_url")
+          prev = v.get("previous_files")
+          json.dump(prev if isinstance(prev, dict) else None, open(os.path.join(os.environ["RUNNER_TEMP"], "vorige.json"), "w"))
+          open(os.path.join(os.environ["RUNNER_TEMP"], "zip_url.txt"), "w").write(url)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o, open(os.environ["GITHUB_ENV"], "a") as e:
+              for k in rules:
+                  o.write(f"{k}={v[k]}\n")
+                  e.write(f"IN_{k.upper()}={v[k]}\n")
+          PY
 
       - name: Zip ophalen en sha256 controleren
         run: |
           set -euo pipefail
-          curl -sS --fail --max-time 60 --max-filesize 3500000 -o "$RUNNER_TEMP/release.zip" "$IN_ZIP_URL" \
+          curl -sS --fail --max-time 60 --max-filesize 3500000 -o "$RUNNER_TEMP/release.zip" "$(cat "$RUNNER_TEMP/zip_url.txt")" \
             || { echo "REDEN=Zip niet op te halen (link verlopen?)." >> "$GITHUB_ENV"; exit 1; }
+          rm -f "$RUNNER_TEMP/zip_url.txt"
           GOT=$(sha256sum "$RUNNER_TEMP/release.zip" | cut -d' ' -f1)
-          [[ "$GOT" == "$IN_SHA" ]] || { echo "REDEN=sha256 van de zip klopt niet." >> "$GITHUB_ENV"; exit 1; }
+          [[ "$GOT" == "$IN_SHA256" ]] || { echo "REDEN=sha256 van de zip klopt niet." >> "$GITHUB_ENV"; exit 1; }
 
       - name: Commit staat op main
         env:
@@ -82,28 +99,25 @@ jobs:
           gh api "repos/$SOURCE_REPO/zipball/$IN_COMMIT" > "$RUNNER_TEMP/bron.zip"
           mkdir -p "$RUNNER_TEMP/bron" && unzip -q "$RUNNER_TEMP/bron.zip" -d "$RUNNER_TEMP/bron"
 
-      - name: Eigen repo ophalen (scripts en vorige handtekeningen)
-        run: |
-          set -euo pipefail
-          git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" "$RUNNER_TEMP/self"
+      - name: Scripts van deze repo ophalen
+        run: git clone -q --depth 1 "https://github.com/${{ github.repository }}" "$RUNNER_TEMP/self"
 
       - name: Vergelijken met de bron
-        id: vergelijk
         run: |
           set -euo pipefail
           ROOT=$(find "$RUNNER_TEMP/bron" -mindepth 1 -maxdepth 1 -type d | head -1)
-          PREV_DIR="$RUNNER_TEMP/self/getekend/$IN_KIND/$IN_SLUG"
-          PREV=$(ls "$PREV_DIR"/*.json 2>/dev/null | sort -V | tail -1 || true)
+          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); p is not None and json.dump({"bestanden": p}, open(sys.argv[2], "w"))' "$RUNNER_TEMP/vorige.json" "$RUNNER_TEMP/vorige-manifest.json"
+          PREV=""; [[ -f "$RUNNER_TEMP/vorige-manifest.json" ]] && PREV="$RUNNER_TEMP/vorige-manifest.json"
           set +e
-          python3 "$RUNNER_TEMP/self/scripts/vergelijk.py" "$RUNNER_TEMP/release.zip" "$ROOT/$IN_SOURCE_DIR" "$IN_KIND" "$IN_SLUG" "$IN_VERSION" "${PREV:-}" > "$RUNNER_TEMP/uitslag.json"
+          python3 "$RUNNER_TEMP/self/scripts/vergelijk.py" "$RUNNER_TEMP/release.zip" "$ROOT/$IN_SOURCE_DIR" "$IN_KIND" "$IN_SLUG" "$IN_VERSION" "$PREV" > "$RUNNER_TEMP/uitslag.json"
           CODE=$?
           set -e
-          python3 - "$RUNNER_TEMP/uitslag.json" "$CODE" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$RUNNER_TEMP/uitslag.json" <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json, os, sys
           u = json.load(open(sys.argv[1])); e = os.environ
           print(f"## {'Klaar om te tekenen' if u.get('ok') else 'Afgekeurd'}: {e['IN_KIND']} {e['IN_SLUG']} {e['IN_VERSION']}\n")
           print(f"- Commit: https://github.com/{e['SOURCE_REPO']}/commit/{e['IN_COMMIT']}")
-          print(f"- Bronmap: `{e['IN_SOURCE_DIR']}`, sha256 `{e['IN_SHA'][:16]}…`, {u.get('aantal_bestanden', 0)} bestanden gelijk aan de bron")
+          print(f"- Bronmap: `{e['IN_SOURCE_DIR']}`, sha256 `{e['IN_SHA256'][:16]}…`, {u.get('aantal_bestanden', 0)} bestanden gelijk aan de bron")
           for f in u.get("fouten", []): print(f"- **Fout:** {f}")
           ch = u.get("gewijzigd_sinds_vorige")
           if ch is None: print("- Eerste getekende versie van dit pakket.")
@@ -117,63 +131,47 @@ jobs:
             echo "REDEN=$(python3 -c 'import json,sys; print("; ".join(json.load(open(sys.argv[1]))["fouten"])[:400])' "$RUNNER_TEMP/uitslag.json")" >> "$GITHUB_ENV"
             exit 1
           fi
-          echo "files=$(python3 -c 'import json,sys,base64; print(base64.b64encode(json.dumps(json.load(open(sys.argv[1]))["bestanden"]).encode()).decode())' "$RUNNER_TEMP/uitslag.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Bestandslijst naar Swop Hub (voor de vergelijking bij de volgende versie)
+        env:
+          HUB_SIGN_TOKEN: ${{ secrets.HUB_SIGN_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -c 'import json,os,sys; u=json.load(open(sys.argv[1])); print(json.dumps({"request_id": os.environ["IN_REQUEST"], "status": "checked", "files": u["bestanden"], "run_url": os.environ["RUN_URL"]}))' "$RUNNER_TEMP/uitslag.json" > "$RUNNER_TEMP/checked.json"
+          curl -sS --fail --max-time 30 -X POST -H "Authorization: Bearer $HUB_SIGN_TOKEN" -H "Content-Type: application/json" --data "@$RUNNER_TEMP/checked.json" "$HUB_SIGN_URL" > /dev/null
 
       - name: Afkeuring melden aan Swop Hub
         if: failure()
-        run: |
-          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "nonce": os.environ["IN_NONCE"], "status": "failed", "reason": os.environ.get("REDEN", "Controle mislukt.")[:400], "run_url": os.environ["RUN_URL"]}))')
-          curl -sS --max-time 30 -X POST -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL" || true
         env:
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HUB_SIGN_TOKEN: ${{ secrets.HUB_SIGN_TOKEN }}
+        run: |
+          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "status": "failed", "reason": os.environ.get("REDEN", "Controle mislukt.")[:400], "run_url": os.environ["RUN_URL"]}))')
+          curl -sS --max-time 30 -X POST -H "Authorization: Bearer $HUB_SIGN_TOKEN" -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL" > /dev/null || true
 
   tekenen:
     needs: controleren
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: tekenen
-    permissions:
-      contents: write
+    env:
+      IN_KIND: ${{ needs.controleren.outputs.kind }}
+      IN_SLUG: ${{ needs.controleren.outputs.slug }}
+      IN_VERSION: ${{ needs.controleren.outputs.version }}
+      IN_SHA256: ${{ needs.controleren.outputs.sha256 }}
+      IN_COMMIT: ${{ needs.controleren.outputs.commit }}
     steps:
-      - name: Eigen repo ophalen
-        run: git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" "$RUNNER_TEMP/self"
+      - name: Scripts van deze repo ophalen
+        run: git clone -q --depth 1 "https://github.com/${{ github.repository }}" "$RUNNER_TEMP/self"
 
-      - name: Tekenen
+      - name: Tekenen en naar Swop Hub sturen
         env:
           SWOP_SIGN_KEY: ${{ secrets.SWOP_SIGN_KEY }}
+          HUB_SIGN_TOKEN: ${{ secrets.HUB_SIGN_TOKEN }}
         run: |
           set -euo pipefail
-          php "$RUNNER_TEMP/self/scripts/teken.php" "$IN_KIND" "$IN_SLUG" "$IN_VERSION" "$IN_SHA" "$IN_COMMIT" > "$RUNNER_TEMP/handtekening.json"
-
-      - name: Vastleggen in deze repo
-        env:
-          FILES_B64: ${{ needs.controleren.outputs.files }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/self"
-          mkdir -p "getekend/$IN_KIND/$IN_SLUG"
-          python3 - <<'PY'
-          import base64, json, os
-          e = os.environ
-          sig = json.load(open(os.path.join(e["RUNNER_TEMP"], "handtekening.json")))
-          out = {"handtekening": sig, "bronmap": e["IN_SOURCE_DIR"], "run": e["RUN_URL"],
-                 "bestanden": json.loads(base64.b64decode(e["FILES_B64"]).decode())}
-          json.dump(out, open(f"getekend/{e['IN_KIND']}/{e['IN_SLUG']}/{e['IN_VERSION']}.json", "w"), indent=1, sort_keys=True)
-          PY
-          git config user.name "Swop Sign"
-          git config user.email "swop-sign@users.noreply.github.com"
-          git add getekend
-          git commit -q -m "Getekend: $IN_KIND $IN_SLUG $IN_VERSION"
-          git push -q origin HEAD:main || echo "::warning::Vastleggen in de repo mislukt; de handtekening gaat wel naar Swop Hub."
-
-      - name: Handtekening naar Swop Hub
-        env:
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "nonce": os.environ["IN_NONCE"], "status": "signed", "signature": json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "handtekening.json"))), "run_url": os.environ["RUN_URL"]}))')
-          curl -sS --fail --max-time 30 -X POST -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL"
+          php "$RUNNER_TEMP/self/scripts/teken.php" "$IN_KIND" "$IN_SLUG" "$IN_VERSION" "$IN_SHA256" "$IN_COMMIT" > "$RUNNER_TEMP/handtekening.json"
+          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "status": "signed", "signature": json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "handtekening.json"))), "run_url": os.environ["RUN_URL"]}))')
+          curl -sS --fail --max-time 30 -X POST -H "Authorization: Bearer $HUB_SIGN_TOKEN" -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL" > /dev/null
           echo "## Getekend: $IN_KIND $IN_SLUG $IN_VERSION" >> "$GITHUB_STEP_SUMMARY"
 
   afgewezen:
@@ -184,8 +182,8 @@ jobs:
     steps:
       - name: Niet getekend melden aan Swop Hub
         env:
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HUB_SIGN_TOKEN: ${{ secrets.HUB_SIGN_TOKEN }}
           RESULT: ${{ needs.tekenen.result }}
         run: |
-          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "nonce": os.environ["IN_NONCE"], "status": "rejected", "reason": "Niet getekend (" + os.environ["RESULT"] + ").", "run_url": os.environ["RUN_URL"]}))')
-          curl -sS --max-time 30 -X POST -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL" || true
+          BODY=$(python3 -c 'import json,os; print(json.dumps({"request_id": os.environ["IN_REQUEST"], "status": "rejected", "reason": "Niet getekend (" + os.environ["RESULT"] + ").", "run_url": os.environ["RUN_URL"]}))')
+          curl -sS --max-time 30 -X POST -H "Authorization: Bearer $HUB_SIGN_TOKEN" -H "Content-Type: application/json" --data "$BODY" "$HUB_SIGN_URL" > /dev/null || true
